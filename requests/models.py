@@ -6,21 +6,24 @@ requests.models
 
 """
 
-import requests
 import urllib
 import urllib2
 import socket
 import zlib
 
 from urllib2 import HTTPError
-from urlparse import urlparse
+from urlparse import urlparse, urlunparse
+from datetime import datetime
 
-from .monkeys import Request as _Request, HTTPBasicAuthHandler, HTTPDigestAuthHandler, HTTPRedirectHandler
+from .config import settings
+from .monkeys import Request as _Request, HTTPBasicAuthHandler, HTTPForcedBasicAuthHandler, HTTPDigestAuthHandler, HTTPRedirectHandler
 from .structures import CaseInsensitiveDict
 from .packages.poster.encode import multipart_encode
 from .packages.poster.streaminghttp import register_openers, get_handlers
 from .exceptions import RequestException, AuthenticationError, Timeout, URLRequired, InvalidMethod
 
+
+REDIRECT_STATI = (301, 302, 303, 307)
 
 
 class Request(object):
@@ -28,11 +31,12 @@ class Request(object):
     Requests. Recommended interface is with the Requests functions.
     """
 
-    _METHODS = ('GET', 'HEAD', 'PUT', 'POST', 'DELETE')
+    _METHODS = ('GET', 'HEAD', 'PUT', 'POST', 'DELETE', 'PATCH')
 
-    def __init__(self, url=None, headers=dict(), files=None, method=None,
-                 data=dict(), auth=None, cookiejar=None, timeout=None,
-                 redirect=True, allow_redirects=False):
+    def __init__(self,
+        url=None, headers=dict(), files=None, method=None, data=dict(),
+        params=dict(), auth=None, cookiejar=None, timeout=None, redirect=False,
+        allow_redirects=False, proxies=None):
 
         socket.setdefaulttimeout(timeout)
 
@@ -44,23 +48,22 @@ class Request(object):
         self.files = files
         #: HTTP Method to use. Available: GET, HEAD, PUT, POST, DELETE.
         self.method = method
-        #: Form or Byte data to attach to the :class:`Request <models.Request>`.
-        self.data = dict()
+        #: Dictionary or byte of request body data to attach to the
+        #: :class:`Request <models.Request>`.
+        self.data = None
+        #: Dictionary or byte of querystring data to attach to the
+        #: :class:`Request <models.Request>`.
+        self.params = None
         #: True if :class:`Request <models.Request>` is part of a redirect chain (disables history
         #: and HTTPError storage).
         self.redirect = redirect
         #: Set to True if full redirects are allowed (e.g. re-POST-ing of data at new ``Location``)
         self.allow_redirects = allow_redirects
+        # Dictionary mapping protocol to the URL of the proxy (e.g. {'http': 'foo.bar:3128'})
+        self.proxies = proxies
 
-        if hasattr(data, 'items'):
-            for (k, v) in data.items():
-                self.data.update({
-                    k.encode('utf-8') if isinstance(k, unicode) else k:
-                    v.encode('utf-8') if isinstance(v, unicode) else v
-                })
-            self._enc_data = urllib.urlencode(self.data)
-        else:
-            self._enc_data = self.data = data
+        self.data, self._enc_data = self._encode_params(data)
+        self.params, self._enc_params = self._encode_params(params)
 
         #: :class:`Response <models.Response>` instance, containing
         #: content and metadata of HTTP Response, once :attr:`sent <send>`.
@@ -76,6 +79,23 @@ class Request(object):
         self.cookiejar = cookiejar
         #: True if Request has been sent.
         self.sent = False
+
+
+        # Header manipulation and defaults.
+
+        if settings.accept_gzip:
+            settings.base_headers.update({'Accept-Encoding': 'gzip'})
+
+        if headers:
+            headers = CaseInsensitiveDict(self.headers)
+        else:
+            headers = CaseInsensitiveDict()
+
+        for (k, v) in settings.base_headers.items():
+            if k not in headers:
+                headers[k] = v
+
+        self.headers = headers
 
 
     def __repr__(self):
@@ -113,6 +133,8 @@ class Request(object):
 
             _handlers.append(self.auth.handler)
 
+        if self.proxies:
+            _handlers.append(urllib2.ProxyHandler(self.proxies))
 
         _handlers.append(HTTPRedirectHandler)
 
@@ -135,6 +157,7 @@ class Request(object):
 
         return opener.open
 
+
     def _build_response(self, resp):
         """Build internal :class:`Response <models.Response>` object from given response."""
 
@@ -145,15 +168,10 @@ class Request(object):
 
             try:
                 response.headers = CaseInsensitiveDict(getattr(resp.info(), 'dict', None))
-                response.content = resp.read()
+                response.read = resp.read
+                response.close = resp.close
             except AttributeError:
                 pass
-
-            if response.headers['content-encoding'] == 'gzip':
-                try:
-                    response.content = zlib.decompress(response.content, 16+zlib.MAX_WBITS)
-                except zlib.error:
-                    pass
 
             response.url = getattr(resp, 'url', None)
 
@@ -164,7 +182,7 @@ class Request(object):
 
         r = build(resp)
 
-        if self.redirect:
+        if r.status_code in REDIRECT_STATI and not self.redirect:
 
             while (
                 ('location' in r.headers) and
@@ -177,7 +195,7 @@ class Request(object):
 
                 url = r.headers['location']
 
-                # Facilitate for non-RFC2616-compliant 'location' headers
+                # Facilitate non-RFC2616-compliant 'location' headers
                 # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
                 if not urlparse(url).netloc:
                     parent_url_components = urlparse(self.url)
@@ -191,7 +209,8 @@ class Request(object):
 
                 request = Request(
                     url, self.headers, self.files, method,
-                    self.data, self.auth, self.cookiejar, redirect=False
+                    self.data, self.params, self.auth, self.cookiejar,
+                    redirect=True
                 )
                 request.send()
                 r = request.response
@@ -202,16 +221,43 @@ class Request(object):
 
 
     @staticmethod
-    def _build_url(url, data=None):
-        """Build URLs."""
+    def _encode_params(data):
+        """Encode parameters in a piece of data.
 
-        if urlparse(url).query:
-            return '%s&%s' % (url, data)
+        If the data supplied is a dictionary, encodes each parameter in it, and
+        returns a list of tuples containing the encoded parameters, and a urlencoded
+        version of that.
+
+        Otherwise, assumes the data is already encoded appropriately, and
+        returns it twice.
+
+        """
+        if hasattr(data, 'items'):
+            result = []
+            for k, vs in data.items():
+                for v in isinstance(vs, list) and vs or [vs]:
+                    result.append((k.encode('utf-8') if isinstance(k, unicode) else k,
+                                   v.encode('utf-8') if isinstance(v, unicode) else v))
+            return result, urllib.urlencode(result, doseq=True)
         else:
-            if data:
-                return '%s?%s' % (url, data)
+            return data, data
+
+
+    def _build_url(self):
+        """Build the actual URL to use"""
+
+        # Support for unicode domain names.
+        parsed_url = list(urlparse(self.url))
+        parsed_url[1] = parsed_url[1].encode('idna')
+        self.url = urlunparse(parsed_url)
+
+        if self._enc_params:
+            if urlparse(self.url).query:
+                return '%s&%s' % (self.url, self._enc_params)
             else:
-                return url
+                return '%s?%s' % (self.url, self._enc_params)
+        else:
+            return self.url
 
 
     def send(self, anyway=False):
@@ -227,8 +273,16 @@ class Request(object):
         self._checks()
         success = False
 
+        # Logging
+        if settings.verbose:
+            settings.verbose.write('%s   %s   %s\n' % (
+                datetime.now().isoformat(), self.method, self.url
+            ))
+
+
+        url = self._build_url()
         if self.method in ('GET', 'HEAD', 'DELETE'):
-            req = _Request(self._build_url(self.url, self._enc_data), method=self.method)
+            req = _Request(url, method=self.method)
         else:
 
             if self.files:
@@ -238,10 +292,10 @@ class Request(object):
                     self.files.update(self.data)
 
                 datagen, headers = multipart_encode(self.files)
-                req = _Request(self.url, data=datagen, headers=headers, method=self.method)
+                req = _Request(url, data=datagen, headers=headers, method=self.method)
 
             else:
-                req = _Request(self.url, data=self._enc_data, method=self.method)
+                req = _Request(url, data=self._enc_data, method=self.method)
 
         if self.headers:
             req.headers.update(self.headers)
@@ -255,12 +309,15 @@ class Request(object):
                 if self.cookiejar is not None:
                     self.cookiejar.extract_cookies(resp, req)
 
-            except urllib2.HTTPError, why:
+            except (urllib2.HTTPError, urllib2.URLError), why:
+                if hasattr(why, 'reason'):
+                    if isinstance(why.reason, socket.timeout):
+                        why = Timeout(why)
+
                 self._build_response(why)
                 if not self.redirect:
                     self.response.error = why
-            except urllib2.URLError, error:
-                raise Timeout if isinstance(error.reason, socket.timeout) else error
+
             else:
                 self._build_response(resp)
                 self.response.ok = True
@@ -271,11 +328,8 @@ class Request(object):
 
         self.sent = self.response.ok
 
+
         return self.sent
-
-
-    def read(self, *args):
-        return self.response.read()
 
 
 
@@ -290,7 +344,7 @@ class Response(object):
         #: Raw content of the response, in bytes.
         #: If ``content-encoding`` of response was set to ``gzip``, the
         #: response data will be automatically deflated.
-        self.content = None
+        self._content = None
         #: Integer Code of responded HTTP Status.
         self.status_code = None
         #: Case-insensitive Dictionary of Response Headers.
@@ -320,16 +374,24 @@ class Response(object):
         return not self.error
 
 
+    def __getattr__(self, name):
+        """Read and returns the full stream when accessing to :attr: `content`"""
+        if name == 'content':
+            if self._content is not None:
+                return self._content
+            self._content = self.read()
+            if self.headers.get('content-encoding', '') == 'gzip':
+                try:
+                    self._content = zlib.decompress(self._content, 16+zlib.MAX_WBITS)
+                except zlib.error:
+                    pass
+            return self._content
+
+
     def raise_for_status(self):
-        """Raises stored :class:`HTTPError`, if one occured."""
+        """Raises stored :class:`HTTPError` or :class:`URLError`, if one occured."""
         if self.error:
             raise self.error
-
-    def read(self, *args):
-        """Returns :attr:`content`. Used for file-like object compatiblity."""
-
-        return self.content
-
 
 
 class AuthManager(object):
@@ -487,17 +549,18 @@ class AuthObject(object):
 
     _handlers = {
         'basic': HTTPBasicAuthHandler,
+        'forced_basic': HTTPForcedBasicAuthHandler,
         'digest': HTTPDigestAuthHandler,
         'proxy_basic': urllib2.ProxyBasicAuthHandler,
         'proxy_digest': urllib2.ProxyDigestAuthHandler
     }
 
-    def __init__(self, username, password, handler='basic', realm=None):
+    def __init__(self, username, password, handler='forced_basic', realm=None):
         self.username = username
         self.password = password
         self.realm = realm
 
         if isinstance(handler, basestring):
-            self.handler = self._handlers.get(handler.lower(), urllib2.HTTPBasicAuthHandler)
+            self.handler = self._handlers.get(handler.lower(), HTTPForcedBasicAuthHandler)
         else:
             self.handler = handler

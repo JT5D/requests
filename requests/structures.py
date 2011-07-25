@@ -8,57 +8,40 @@ Datastructures that power Requests.
 
 """
 
-from UserDict import DictMixin
-
-
-class CaseInsensitiveDict(DictMixin):
-    """Case-insensitive Dictionary for :class:`Response <models.Response>` Headers.
+class CaseInsensitiveDict(dict):
+    """Case-insensitive Dictionary
 
     For example, ``headers['content-encoding']`` will return the
     value of a ``'Content-Encoding'`` response header."""
 
-    def __init__(self, *args, **kwargs):
-        # super(CaseInsensitiveDict, self).__init__()
-        self.data = dict(*args, **kwargs)
+    @property
+    def lower_keys(self):
+        if not hasattr(self, '_lower_keys') or not self._lower_keys:
+            self._lower_keys = dict((k.lower(), k) for k in self.iterkeys())
+        return self._lower_keys
 
-    def __repr__(self):
-        return self.data.__repr__()
-
-    def __getstate__(self):
-        return self.data.copy()
-
-    def __setstate__(self, d):
-        self.data = d
-
-    def _lower_keys(self):
-        return map(str.lower, self.data.keys())
-
-
-    def __contains__(self, key):
-        return key.lower() in self._lower_keys()
-
-
-    def __getitem__(self, key):
-
-        if key.lower() in self:
-            return self.items()[self._lower_keys().index(key.lower())][1]
-
+    def _clear_lower_keys(self):
+        if hasattr(self, '_lower_keys'):
+            self._lower_keys.clear()
 
     def __setitem__(self, key, value):
-        return self.data.__setitem__(key, value)
-
+        dict.__setitem__(self, key, value)
+        self._clear_lower_keys()
 
     def __delitem__(self, key):
-        return self.data.__delitem__(key)
+        dict.__delitem__(self, key)
+        self._lower_keys.clear()
 
+    def __contains__(self, key):
+        return key.lower() in self.lower_keys
 
-    def __keys__(self):
-        return self.data.__keys__()
+    def __getitem__(self, key):
+        # We allow fall-through here, so values default to None
+        if key in self:
+            return dict.__getitem__(self, self.lower_keys[key.lower()])
 
-
-    def __iter__(self):
-        return self.data.__iter__()
-
-
-    def iteritems(self):
-        return self.data.iteritems()
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        else:
+            return default

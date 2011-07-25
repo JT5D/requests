@@ -12,7 +12,7 @@ class Settings(object):
     _singleton = {}
 
     # attributes with defaults
-    __attrs__ = ('timeout',)
+    __attrs__ = ('timeout', 'verbose')
 
     def __init__(self, **kwargs):
         super(Settings, self).__init__()
@@ -54,3 +54,5 @@ class Settings(object):
         return object.__getattribute__(self, key)
 
 settings = Settings()
+settings.base_headers = {'User-Agent': 'python-requests.org'}
+settings.accept_gzip = True
