@@ -1,6 +1,33 @@
 History
 -------
 
+
+0.6.1 (2011-08-20)
+++++++++++++++++++
+
+* Enhanced status codes experience ``\o/``
+* Set a maximum number of redirects (``settings.max_redirects``)
+* Full Unicode URL support
+* Support for protocol-less redirects.
+* Allow for arbitrary request types.
+* Bugfixes
+
+
+0.6.0 (2011-08-17)
+++++++++++++++++++
+
+* New callback hook system
+* New persistient sessions object and context manager
+* Transparent Dict-cookie handling
+* Status code reference object
+* Removed Response.cached
+* Added Response.request
+* All args are kwargs
+* Relative redirect support
+* HTTPError handling improvements
+* Improved https testing
+* Bugfixes
+
 0.5.1 (2011-07-23)
 ++++++++++++++++++
 

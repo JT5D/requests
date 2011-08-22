@@ -12,7 +12,7 @@ import socket
 import zlib
 
 from urllib2 import HTTPError
-from urlparse import urlparse, urlunparse
+from urlparse import urlparse, urlunparse, urljoin
 from datetime import datetime
 
 from .config import settings
@@ -20,10 +20,13 @@ from .monkeys import Request as _Request, HTTPBasicAuthHandler, HTTPForcedBasicA
 from .structures import CaseInsensitiveDict
 from .packages.poster.encode import multipart_encode
 from .packages.poster.streaminghttp import register_openers, get_handlers
-from .exceptions import RequestException, AuthenticationError, Timeout, URLRequired, InvalidMethod
+from .utils import dict_from_cookiejar
+from .exceptions import RequestException, AuthenticationError, Timeout, URLRequired, InvalidMethod, TooManyRedirects
+from .status_codes import codes
 
 
-REDIRECT_STATI = (301, 302, 303, 307)
+REDIRECT_STATI = (codes.moved, codes.found, codes.other, codes.temporary_moved)
+
 
 
 class Request(object):
@@ -31,34 +34,42 @@ class Request(object):
     Requests. Recommended interface is with the Requests functions.
     """
 
-    _METHODS = ('GET', 'HEAD', 'PUT', 'POST', 'DELETE', 'PATCH')
-
     def __init__(self,
         url=None, headers=dict(), files=None, method=None, data=dict(),
         params=dict(), auth=None, cookiejar=None, timeout=None, redirect=False,
         allow_redirects=False, proxies=None):
 
-        socket.setdefaulttimeout(timeout)
+        #: Float describ the timeout of the request.
+        #  (Use socket.setdefaulttimeout() as fallback)
+        self.timeout = timeout
 
         #: Request URL.
         self.url = url
+
         #: Dictonary of HTTP Headers to attach to the :class:`Request <models.Request>`.
         self.headers = headers
+
         #: Dictionary of files to multipart upload (``{filename: content}``).
         self.files = files
+
         #: HTTP Method to use. Available: GET, HEAD, PUT, POST, DELETE.
         self.method = method
+
         #: Dictionary or byte of request body data to attach to the
         #: :class:`Request <models.Request>`.
         self.data = None
+
         #: Dictionary or byte of querystring data to attach to the
         #: :class:`Request <models.Request>`.
         self.params = None
+
         #: True if :class:`Request <models.Request>` is part of a redirect chain (disables history
         #: and HTTPError storage).
         self.redirect = redirect
+
         #: Set to True if full redirects are allowed (e.g. re-POST-ing of data at new ``Location``)
         self.allow_redirects = allow_redirects
+
         # Dictionary mapping protocol to the URL of the proxy (e.g. {'http': 'foo.bar:3128'})
         self.proxies = proxies
 
@@ -73,10 +84,13 @@ class Request(object):
             auth = AuthObject(*auth)
         if not auth:
             auth = auth_manager.get_auth(self.url)
+
         #: :class:`AuthObject` to attach to :class:`Request <models.Request>`.
         self.auth = auth
+
         #: CookieJar to attach to :class:`Request <models.Request>`.
         self.cookiejar = cookiejar
+
         #: True if Request has been sent.
         self.sent = False
 
@@ -102,14 +116,6 @@ class Request(object):
         return '<Request [%s]>' % (self.method)
 
 
-    def __setattr__(self, name, value):
-        if (name == 'method') and (value):
-            if not value in self._METHODS:
-                raise InvalidMethod()
-
-        object.__setattr__(self, name, value)
-
-
     def _checks(self):
         """Deterministic checks for consistency."""
 
@@ -127,6 +133,7 @@ class Request(object):
 
         if self.auth:
             if not isinstance(self.auth.handler, (urllib2.AbstractBasicAuthHandler, urllib2.AbstractDigestAuthHandler)):
+                # TODO: REMOVE THIS COMPLETELY
                 auth_manager.add_password(self.auth.realm, self.url, self.auth.username, self.auth.password)
                 self.auth.handler = self.auth.handler(auth_manager)
                 auth_manager.add_auth(self.url, self.auth)
@@ -158,7 +165,7 @@ class Request(object):
         return opener.open
 
 
-    def _build_response(self, resp):
+    def _build_response(self, resp, is_error=False):
         """Build internal :class:`Response <models.Response>` object from given response."""
 
         def build(resp):
@@ -169,9 +176,19 @@ class Request(object):
             try:
                 response.headers = CaseInsensitiveDict(getattr(resp.info(), 'dict', None))
                 response.read = resp.read
-                response.close = resp.close
+                response._resp = resp
+                response._close = resp.close
+
+                if self.cookiejar:
+
+                    response.cookies = dict_from_cookiejar(self.cookiejar)
+
+
             except AttributeError:
                 pass
+
+            if is_error:
+                response.error = resp
 
             response.url = getattr(resp, 'url', None)
 
@@ -187,22 +204,31 @@ class Request(object):
             while (
                 ('location' in r.headers) and
                 ((self.method in ('GET', 'HEAD')) or
-                (r.status_code is 303) or
+                (r.status_code is codes.see_other) or
                 (self.allow_redirects))
             ):
+
+                r.close()
+
+                if not len(history) < settings.max_redirects:
+                    raise TooManyRedirects()
 
                 history.append(r)
 
                 url = r.headers['location']
 
+                # Handle redirection without scheme (see: RFC 1808 Section 4)
+                if url.startswith('//'):
+                    parsed_rurl = urlparse(r.url)
+                    url = '%s:%s' % (parsed_rurl.scheme, url)
+
                 # Facilitate non-RFC2616-compliant 'location' headers
                 # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
                 if not urlparse(url).netloc:
-                    parent_url_components = urlparse(self.url)
-                    url = '%s://%s/%s' % (parent_url_components.scheme, parent_url_components.netloc, url)
+                    url = urljoin(r.url, urllib.quote(urllib.unquote(url)))
 
                 # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.3.4
-                if r.status_code is 303:
+                if r.status_code is codes.see_other:
                     method = 'GET'
                 else:
                     method = self.method
@@ -218,6 +244,7 @@ class Request(object):
             r.history = history
 
         self.response = r
+        self.response.request = self
 
 
     @staticmethod
@@ -244,12 +271,15 @@ class Request(object):
 
 
     def _build_url(self):
-        """Build the actual URL to use"""
+        """Build the actual URL to use."""
 
-        # Support for unicode domain names.
-        parsed_url = list(urlparse(self.url))
-        parsed_url[1] = parsed_url[1].encode('idna')
-        self.url = urlunparse(parsed_url)
+        # Support for unicode domain names and paths.
+        scheme, netloc, path, params, query, fragment = urlparse(self.url)
+        netloc = netloc.encode('idna')
+        if isinstance(path, unicode):
+            path = path.encode('utf-8')
+        path = urllib.quote(urllib.unquote(path))
+        self.url = str(urlunparse([ scheme, netloc, path, params, query, fragment ]))
 
         if self._enc_params:
             if urlparse(self.url).query:
@@ -270,6 +300,7 @@ class Request(object):
         :param anyway: If True, request will be sent, even if it has
         already been sent.
         """
+
         self._checks()
         success = False
 
@@ -298,13 +329,32 @@ class Request(object):
                 req = _Request(url, data=self._enc_data, method=self.method)
 
         if self.headers:
-            req.headers.update(self.headers)
+            for k,v in self.headers.iteritems():
+                req.add_header(k, v)
 
         if not self.sent or anyway:
 
             try:
                 opener = self._get_opener()
-                resp = opener(req)
+                try:
+
+                    resp = opener(req, timeout=self.timeout)
+
+                except TypeError, err:
+                    # timeout argument is new since Python v2.6
+                    if not 'timeout' in str(err):
+                        raise
+
+                    if settings.timeout_fallback:
+                        # fall-back and use global socket timeout (This is not thread-safe!)
+                        old_timeout = socket.getdefaulttimeout()
+                        socket.setdefaulttimeout(self.timeout)
+
+                    resp = opener(req)
+
+                    if settings.timeout_fallback:
+                        # restore gobal timeout
+                        socket.setdefaulttimeout(old_timeout)
 
                 if self.cookiejar is not None:
                     self.cookiejar.extract_cookies(resp, req)
@@ -314,20 +364,15 @@ class Request(object):
                     if isinstance(why.reason, socket.timeout):
                         why = Timeout(why)
 
-                self._build_response(why)
-                if not self.redirect:
-                    self.response.error = why
+                self._build_response(why, is_error=True)
+
 
             else:
                 self._build_response(resp)
                 self.response.ok = True
 
-            self.response.cached = False
-        else:
-            self.response.cached = True
 
         self.sent = self.response.ok
-
 
         return self.sent
 
@@ -357,12 +402,14 @@ class Response(object):
         self.ok = False
         #: Resulting :class:`HTTPError` of request, if one occured.
         self.error = None
-        #: True, if the response :attr:`content` is cached locally.
-        self.cached = False
         #: A list of :class:`Response <models.Response>` objects from
         #: the history of the Request. Any redirect responses will end
         #: up here.
         self.history = []
+        #: The Request that created the Response.
+        self.request = None
+        #: A dictionary of Cookies the server sent back.
+        self.cookies = None
 
 
     def __repr__(self):
@@ -386,13 +433,19 @@ class Response(object):
                 except zlib.error:
                     pass
             return self._content
-
+        else:
+            raise AttributeError
 
     def raise_for_status(self):
         """Raises stored :class:`HTTPError` or :class:`URLError`, if one occured."""
         if self.error:
             raise self.error
 
+
+    def close(self):
+        if self._resp.fp is not None and hasattr(self._resp.fp, '_sock'):
+            self._resp.fp._sock.recv = None
+        self._close()
 
 class AuthManager(object):
     """Requests Authentication Manager."""
@@ -467,8 +520,10 @@ class AuthManager(object):
 
     def reduce_uri(self, uri, default_port=True):
         """Accept authority or URI and extract only the authority and path."""
+
         # note HTTP URLs do not have a userinfo component
         parts = urllib2.urlparse.urlsplit(uri)
+
         if parts[1]:
             # URI
             scheme = parts[0]
@@ -479,7 +534,9 @@ class AuthManager(object):
             scheme = None
             authority = uri
             path = '/'
+
         host, port = urllib2.splitport(authority)
+
         if default_port and port is None and scheme is not None:
             dport = {"http": 80,
                      "https": 443,
